@@ -1,0 +1,10 @@
+/checkpoints
+/outputs
+/stage4_model
+/stage5_model
+stage4test.ipynb
+changed.ipynb
+AGENTS.md
+CLAUDE.md
+diffusion_model/__pycache__
+/tests
