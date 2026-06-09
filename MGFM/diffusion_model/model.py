@@ -20,7 +20,7 @@ from diffusion_model.flow_features import (
     window_center,
 )
 from diffusion_model.gait_metrics import compute_gait_metrics_torch
-from diffusion_model.losses import JOINT_ANGLE_NAMES, joint_angle_velocities, joint_angles, motion_losses
+from diffusion_model.losses import JOINT_ANGLE_NAMES, com_stability_loss, joint_angle_velocities, joint_angles, motion_losses, mos_loss
 from diffusion_model.sensor_model import IMU_FUSION_SCHEMA, IMU_FUSION_SCHEMA_CNN, IMU_FUSION_SCHEMA_CNN_DIFF, IMULatentAligner
 from diffusion_model.skeleton_model import (
     GraphDenoiserMasked,
@@ -407,6 +407,12 @@ class IMUConditionedSkeletonFlowModel(nn.Module):
         loss_vel = F.smooth_l1_loss(
             x_pred[:, 1:] - x_pred[:, :-1], x_centered[:, 1:] - x_centered[:, :-1]
         )
+        # --lambda_mos weights the Hof (2005) Margin-of-Stability matching loss
+        # (GT-matched, so it does not suppress falls), not raw CoM-trajectory matching.
+        loss_com = mos_loss(x_pred.float(), x_centered.float(), fps=fps)
+        # --lambda_com weights the simple CoM-vs-BOS stability-margin matching loss
+        # (no momentum term; notebook 'Simple CoM-based Stability Margin' port).
+        loss_com_simple = com_stability_loss(x_pred.float(), x_centered.float())
         loss_gait = (
             F.mse_loss(gait_gen, gait_target.float())
             if gait_target is not None
@@ -432,6 +438,8 @@ class IMUConditionedSkeletonFlowModel(nn.Module):
             "loss_diff": loss_flow,
             "loss_pose": loss_pose,
             "loss_vel": loss_vel,
+            "loss_com": loss_com,
+            "loss_com_simple": loss_com_simple,
             "loss_gait": loss_gait,
             **loss_terms,
         }

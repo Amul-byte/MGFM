@@ -73,6 +73,11 @@ def extract_subject_ids(dataset: Dataset) -> Optional[list[int]]:
     return [int(x) for x in subject_ids]
 
 
+# Hardcoded held-out test subjects: NEVER used for training or validation under
+# any split mode. Reserved as a final unseen test set for generation/evaluation.
+RESERVED_TEST_SUBJECTS: tuple[int, ...] = (62, 63)
+
+
 def split_train_val_dataset(
     dataset: Dataset,
     val_split: float,
@@ -80,15 +85,29 @@ def split_train_val_dataset(
     train_subjects: Optional[list[int]] = None,
     logger=None,
 ) -> tuple[Dataset, Optional[Dataset]]:
-    """Split dataset into train/val subsets, using subject-wise partitioning when requested."""
+    """Split dataset into train/val subsets, using subject-wise partitioning when requested.
+
+    Subjects in RESERVED_TEST_SUBJECTS are excluded from both train and val in every
+    branch, even if explicitly listed in ``train_subjects``.
+    """
     subject_ids = extract_subject_ids(dataset)
+    reserved = set(RESERVED_TEST_SUBJECTS)
+    if subject_ids is not None and logger is not None:
+        reserved_present = sorted({sid for sid in subject_ids if sid in reserved})
+        if reserved_present:
+            logger.info("Reserved test subjects excluded from train/val: %s", reserved_present)
+
     if train_subjects:
         if subject_ids is None:
             raise ValueError("Subject-wise split requested, but dataset does not expose per-sample subject_ids.")
-        train_subject_set = {int(sid) for sid in train_subjects}
+        train_subject_set = {int(sid) for sid in train_subjects} - reserved
         all_subjects = sorted(set(subject_ids))
         train_idx = [idx for idx, sid in enumerate(subject_ids) if sid in train_subject_set]
-        val_idx = [idx for idx, sid in enumerate(subject_ids) if sid not in train_subject_set]
+        val_idx = [
+            idx
+            for idx, sid in enumerate(subject_ids)
+            if sid not in train_subject_set and sid not in reserved
+        ]
         missing_subjects = sorted(train_subject_set.difference(all_subjects))
         if missing_subjects and logger is not None:
             logger.warning("Requested train subjects not present in dataset: %s", missing_subjects)
@@ -103,15 +122,21 @@ def split_train_val_dataset(
             logger.info("Train samples=%s Val samples=%s", len(train_idx), len(val_idx))
         return Subset(dataset, train_idx), Subset(dataset, val_idx)
 
+    # Random split: restrict the eligible pool to non-reserved subjects first.
+    if subject_ids is not None:
+        eligible = [idx for idx, sid in enumerate(subject_ids) if sid not in reserved]
+    else:
+        eligible = list(range(len(dataset)))
+
     if val_split <= 0.0:
-        return dataset, None
-    total = len(dataset)
+        return Subset(dataset, eligible), None
+    total = len(eligible)
     if total < 2:
         raise ValueError("Validation split requires at least 2 samples.")
     n_val = max(1, int(round(total * val_split)))
     n_val = min(n_val, total - 1)
     g = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(total, generator=g).tolist()
+    perm = [eligible[i] for i in torch.randperm(total, generator=g).tolist()]
     train_idx = perm[:-n_val]
     val_idx = perm[-n_val:]
     return Subset(dataset, train_idx), Subset(dataset, val_idx)

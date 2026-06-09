@@ -514,6 +514,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--no_pin_memory", action="store_true")
     parser.add_argument("--epochs", type=int, default=250)
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=20,
+        help="Stop training if the monitored loss (val if available, else train) does not "
+        "improve for this many consecutive epochs. Set 0 to disable.",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_dir", type=str, default="checkpoints")
@@ -590,6 +597,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--flow_lr", type=float, default=0.0, help="Stage-5 flow learning rate. Uses --lr when 0.")
     parser.add_argument("--lambda_pose", type=float, default=0.0, help="Weight for paired skeleton reconstruction loss in Stage 5.")
     parser.add_argument("--lambda_vel", type=float, default=0.0, help="Weight for velocity reconstruction loss in Stage 5.")
+    parser.add_argument("--lambda_mos", type=float, default=0.0, help="Weight for Hof (2005) Margin-of-Stability (extrapolated-CoM vs base-of-support) matching loss in Stage 5.")
+    parser.add_argument("--lambda_com", type=float, default=0.0, help="Weight for simple CoM-vs-BOS stability-margin matching loss in Stage 5 (no momentum term).")
     parser.add_argument("--lambda_angle", type=float, default=0.05, help="Weight for SSDL-style per-frame joint-angle Frobenius loss in Stage 5.")
     parser.add_argument("--lambda_angle_limit", type=float, default=1.0, help="Weight for soft key-joint angle-limit penalty in Stage 5.")
     parser.add_argument("--lambda_motion", type=float, default=1.0, help="Weight for motion regularization loss in Stage 5.")
@@ -731,6 +740,7 @@ def train_stage4_imu_pretrain(args: argparse.Namespace, device: torch.device, di
     amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
     os.makedirs(args.save_dir, exist_ok=True)
     best_loss = float("inf")
+    epochs_since_improvement = 0
     history: list[dict[str, float]] = []
     run_dir = Path(args.run_dir)
 
@@ -862,29 +872,46 @@ def train_stage4_imu_pretrain(args: argparse.Namespace, device: torch.device, di
         if _is_main_process():
             write_history(run_dir, "stage4_imu_pretrain", history)
         _print_epoch_summary("Stage4", epoch + 1, args.epochs, metrics, time.time() - t0)
+        # monitor_loss is a synced mean, so it is identical on every rank; compute the
+        # improvement/early-stop bookkeeping on all ranks so DDP processes stop together.
         monitor_loss = avg_val_total if avg_val_total is not None else metrics["train_loss_total"]
-        if _is_main_process() and monitor_loss < best_loss:
+        if monitor_loss < best_loss:
             best_loss = monitor_loss
-            save_checkpoint(
-                os.path.join(args.save_dir, "imu_pretrain_best.pt"),
-                _unwrap_model(model),
-                extra={
-                    "best_monitor_loss": best_loss,
-                    "best_monitor_name": "val_loss_total" if avg_val_total is not None else "train_loss_total",
-                    "best_epoch": epoch + 1,
-                    "encoder_graph_op": args.encoder_graph_op_resolved,
-                    "skeleton_graph_op": args.skeleton_graph_op_resolved,
-                    "gait_metric_names": list(GAIT_METRIC_NAMES),
-                    "imu_feature_names": list(IMU_FEATURE_NAMES),
-                    "imu_angle_target_names": list(JOINT_ANGLE_NAMES),
-                    "imu_angle_auxiliary": "angles_and_angular_velocities_v1",
-                    "imu_skeleton_auxiliary": _unwrap_model(model).imu_skeleton_auxiliary_schema,
-                    "sensor_locations": _sensor_locations_from_args(args),
-                    "sensor_sources": _sensor_sources_from_args(args),
-                    "input_stats": input_stats,
-                    "run_dir": args.run_dir,
-                },
-            )
+            epochs_since_improvement = 0
+            if _is_main_process():
+                save_checkpoint(
+                    os.path.join(args.save_dir, "imu_pretrain_best.pt"),
+                    _unwrap_model(model),
+                    extra={
+                        "best_monitor_loss": best_loss,
+                        "best_monitor_name": "val_loss_total" if avg_val_total is not None else "train_loss_total",
+                        "best_epoch": epoch + 1,
+                        "encoder_graph_op": args.encoder_graph_op_resolved,
+                        "skeleton_graph_op": args.skeleton_graph_op_resolved,
+                        "gait_metric_names": list(GAIT_METRIC_NAMES),
+                        "imu_feature_names": list(IMU_FEATURE_NAMES),
+                        "imu_angle_target_names": list(JOINT_ANGLE_NAMES),
+                        "imu_angle_auxiliary": "angles_and_angular_velocities_v1",
+                        "imu_skeleton_auxiliary": _unwrap_model(model).imu_skeleton_auxiliary_schema,
+                        "sensor_locations": _sensor_locations_from_args(args),
+                        "sensor_sources": _sensor_sources_from_args(args),
+                        "input_stats": input_stats,
+                        "run_dir": args.run_dir,
+                    },
+                )
+        else:
+            epochs_since_improvement += 1
+        if args.early_stopping_patience > 0 and epochs_since_improvement >= args.early_stopping_patience:
+            if _is_main_process():
+                LOGGER.info(
+                    "[early-stop] Stage4: no improvement in %s for %d epochs (patience=%d); stopping at epoch %d/%d.",
+                    "val_loss_total" if avg_val_total is not None else "train_loss_total",
+                    epochs_since_improvement,
+                    args.early_stopping_patience,
+                    epoch + 1,
+                    args.epochs,
+                )
+            break
     if _is_main_process():
         save_checkpoint(
             os.path.join(args.save_dir, "imu_pretrain.pt"),
@@ -958,6 +985,7 @@ def train_stage5_imu_flow(args: argparse.Namespace, device: torch.device, distri
     amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
     os.makedirs(args.save_dir, exist_ok=True)
     best_loss = float("inf")
+    epochs_since_improvement = 0
     history: list[dict[str, float]] = []
     run_dir = Path(args.run_dir)
 
@@ -967,7 +995,7 @@ def train_stage5_imu_flow(args: argparse.Namespace, device: torch.device, distri
         t0 = time.time()
         if distributed and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
-        sums = {key: 0.0 for key in ("total", "flow", "pose", "vel", "gait", "angle", "angle_limit", "motion")}
+        sums = {key: 0.0 for key in ("total", "flow", "pose", "vel", "com", "com_simple", "gait", "angle", "angle_limit", "motion")}
         n_batches = 0
         pbar = _iter_with_progress(train_loader, f"Stage5 Epoch {epoch + 1}/{args.epochs}", enabled=_is_main_process() and sys.stdout.isatty())
         for batch_idx, batch in enumerate(pbar):
@@ -990,6 +1018,8 @@ def train_stage5_imu_flow(args: argparse.Namespace, device: torch.device, distri
                     out["loss_diff"]
                     + args.lambda_pose * out["loss_pose"]
                     + args.lambda_vel * out["loss_vel"]
+                    + args.lambda_mos * out["loss_com"]
+                    + args.lambda_com * out["loss_com_simple"]
                     + args.lambda_angle * out["loss_angle_recon"]
                     + args.lambda_angle_limit * out["loss_angle_limit"]
                     + args.lambda_motion * out["loss_motion"]
@@ -1004,6 +1034,8 @@ def train_stage5_imu_flow(args: argparse.Namespace, device: torch.device, distri
             sums["flow"] += float(out["loss_diff"].item())
             sums["pose"] += float(out["loss_pose"].item())
             sums["vel"] += float(out["loss_vel"].item())
+            sums["com"] += float(out["loss_com"].item())
+            sums["com_simple"] += float(out["loss_com_simple"].item())
             sums["gait"] += float(out["loss_gait"].item())
             sums["angle"] += float(out["loss_angle_recon"].item())
             sums["angle_limit"] += float(out["loss_angle_limit"].item())
@@ -1036,6 +1068,8 @@ def train_stage5_imu_flow(args: argparse.Namespace, device: torch.device, distri
                             out["loss_diff"]
                             + args.lambda_pose * out["loss_pose"]
                             + args.lambda_vel * out["loss_vel"]
+                            + args.lambda_mos * out["loss_com"]
+                            + args.lambda_com * out["loss_com_simple"]
                             + args.lambda_angle * out["loss_angle_recon"]
                             + args.lambda_angle_limit * out["loss_angle_limit"]
                             + args.lambda_motion * out["loss_motion"]
@@ -1045,6 +1079,8 @@ def train_stage5_imu_flow(args: argparse.Namespace, device: torch.device, distri
                     val_sums["flow"] += float(out["loss_diff"].item())
                     val_sums["pose"] += float(out["loss_pose"].item())
                     val_sums["vel"] += float(out["loss_vel"].item())
+                    val_sums["com"] += float(out["loss_com"].item())
+                    val_sums["com_simple"] += float(out["loss_com_simple"].item())
                     val_sums["gait"] += float(out["loss_gait"].item())
                     val_sums["angle"] += float(out["loss_angle_recon"].item())
                     val_sums["angle_limit"] += float(out["loss_angle_limit"].item())
@@ -1059,26 +1095,43 @@ def train_stage5_imu_flow(args: argparse.Namespace, device: torch.device, distri
         if _is_main_process():
             write_history(run_dir, "stage5_imu_flow", history)
         _print_epoch_summary("Stage5", epoch + 1, args.epochs, metrics, time.time() - t0)
+        # monitor_loss is a synced mean, so it is identical on every rank; compute the
+        # improvement/early-stop bookkeeping on all ranks so DDP processes stop together.
         monitor_loss = avg_val_total if avg_val_total is not None else metrics["train_loss_total"]
-        if _is_main_process() and monitor_loss < best_loss:
+        if monitor_loss < best_loss:
             best_loss = monitor_loss
-            save_checkpoint(
-                os.path.join(args.save_dir, "imu_flow_best.pt"),
-                _unwrap_model(model),
-                extra={
-                    "best_monitor_loss": best_loss,
-                    "best_monitor_name": "val_loss_total" if avg_val_total is not None else "train_loss_total",
-                    "best_epoch": epoch + 1,
-                    "imu_pretrain_ckpt": args.imu_pretrain_ckpt,
-                    "skeleton_graph_op": args.skeleton_graph_op_resolved,
-                    "gait_metric_names": list(GAIT_METRIC_NAMES),
-                    "imu_feature_names": list(IMU_FEATURE_NAMES),
-                    "sensor_locations": _sensor_locations_from_args(args),
-                    "sensor_sources": _sensor_sources_from_args(args),
-                    "input_stats": input_stats,
-                    "run_dir": args.run_dir,
-                },
-            )
+            epochs_since_improvement = 0
+            if _is_main_process():
+                save_checkpoint(
+                    os.path.join(args.save_dir, "imu_flow_best.pt"),
+                    _unwrap_model(model),
+                    extra={
+                        "best_monitor_loss": best_loss,
+                        "best_monitor_name": "val_loss_total" if avg_val_total is not None else "train_loss_total",
+                        "best_epoch": epoch + 1,
+                        "imu_pretrain_ckpt": args.imu_pretrain_ckpt,
+                        "skeleton_graph_op": args.skeleton_graph_op_resolved,
+                        "gait_metric_names": list(GAIT_METRIC_NAMES),
+                        "imu_feature_names": list(IMU_FEATURE_NAMES),
+                        "sensor_locations": _sensor_locations_from_args(args),
+                        "sensor_sources": _sensor_sources_from_args(args),
+                        "input_stats": input_stats,
+                        "run_dir": args.run_dir,
+                    },
+                )
+        else:
+            epochs_since_improvement += 1
+        if args.early_stopping_patience > 0 and epochs_since_improvement >= args.early_stopping_patience:
+            if _is_main_process():
+                LOGGER.info(
+                    "[early-stop] Stage5: no improvement in %s for %d epochs (patience=%d); stopping at epoch %d/%d.",
+                    "val_loss_total" if avg_val_total is not None else "train_loss_total",
+                    epochs_since_improvement,
+                    args.early_stopping_patience,
+                    epoch + 1,
+                    args.epochs,
+                )
+            break
     if _is_main_process():
         save_checkpoint(
             os.path.join(args.save_dir, "imu_flow.pt"),
