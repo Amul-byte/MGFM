@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 try:  # pragma: no cover - optional visualization dependency
     import imageio.v2 as imageio
@@ -35,11 +35,15 @@ except Exception:  # pragma: no cover
     Image = None
 
 from diffusion_model.dataset import (
+    RESERVED_TEST_SUBJECTS,
     _fill_nan_with_column_mean,
     _parse_label_14,
     _skeleton_frame_to_joints,
     _windowed,
     create_dataloader,
+    create_dataset,
+    extract_subject_ids,
+    parse_subject_list,
     read_csv_files,
     validate_imu_input_stats,
 )
@@ -326,6 +330,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skeleton_folder", type=str, default="")
     parser.add_argument("--phone_accel_folder", type=str, default="", help="Phone accelerometer CSV folder.")
     parser.add_argument("--watch_accel_folder", type=str, default="", help="Watch accelerometer CSV folder.")
+    parser.add_argument(
+        "--eval_subjects",
+        type=str,
+        default="",
+        help="Comma-separated subjects to run inference on. Defaults to the reserved "
+        f"held-out test subjects {','.join(str(s) for s in RESERVED_TEST_SUBJECTS)}. "
+        "Pass 'all' to disable filtering and run on every subject.",
+    )
     parser.add_argument("--gait_cache_dir", type=str, default="")
     parser.add_argument("--disable_gait_cache", action="store_true")
     parser.add_argument(
@@ -451,8 +463,7 @@ def load_imu_flow_model(args: argparse.Namespace, device: torch.device) -> IMUCo
 
 
 def build_dataloader(args: argparse.Namespace):
-    return create_dataloader(
-        batch_size=args.batch_size,
+    dataset = create_dataset(
         window=args.window,
         joints=args.joints,
         num_classes=args.num_classes,
@@ -460,12 +471,37 @@ def build_dataloader(args: argparse.Namespace):
         phone_accel_folder=args.phone_accel_folder or None,
         watch_accel_folder=args.watch_accel_folder or None,
         stride=args.stride,
+        gait_cache_dir=args.gait_cache_dir or None,
+        disable_gait_cache=args.disable_gait_cache,
+        input_stats=getattr(args, "input_stats", None),
+    )
+
+    # Restrict inference to the held-out test subjects (default: 62, 63) so the
+    # reported reconstruction error is measured on never-trained subjects only.
+    # Pass --eval_subjects all to disable filtering entirely.
+    if args.eval_subjects.strip().lower() == "all":
+        print(f"Inference on ALL subjects (no held-out filter): {len(dataset)} windows.")
+    else:
+        eval_subjects = parse_subject_list(args.eval_subjects) if args.eval_subjects else list(RESERVED_TEST_SUBJECTS)
+        subject_ids = extract_subject_ids(dataset)
+        if subject_ids is None:
+            raise ValueError("Subject-filtered inference requested, but the dataset does not expose per-sample subject_ids.")
+        keep = {int(s) for s in eval_subjects}
+        indices = [i for i, sid in enumerate(subject_ids) if sid in keep]
+        if not indices:
+            raise ValueError(
+                f"No samples found for eval subjects {sorted(keep)}. Present in dataset: {sorted(set(subject_ids))}."
+            )
+        print(f"Inference restricted to subjects {sorted(keep)}: {len(indices)} windows.")
+        dataset = Subset(dataset, indices)
+
+    return create_dataloader(
+        batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=not args.no_pin_memory,
         shuffle=True,
         drop_last=False,
-        gait_cache_dir=args.gait_cache_dir or None,
-        disable_gait_cache=args.disable_gait_cache,
+        dataset=dataset,
         input_stats=getattr(args, "input_stats", None),
     )
 
