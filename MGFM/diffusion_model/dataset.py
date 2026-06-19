@@ -77,6 +77,11 @@ def extract_subject_ids(dataset: Dataset) -> Optional[list[int]]:
 # any split mode. Reserved as a final unseen test set for generation/evaluation.
 RESERVED_TEST_SUBJECTS: tuple[int, ...] = (62, 63)
 
+# Only subjects with id strictly greater than this are eligible for training or
+# validation. Subjects with id <= MIN_SUBJECT_ID are excluded from both train and
+# val in every split mode (independent of RESERVED_TEST_SUBJECTS).
+MIN_SUBJECT_ID: int = 0
+
 
 def split_train_val_dataset(
     dataset: Dataset,
@@ -87,26 +92,36 @@ def split_train_val_dataset(
 ) -> tuple[Dataset, Optional[Dataset]]:
     """Split dataset into train/val subsets, using subject-wise partitioning when requested.
 
-    Subjects in RESERVED_TEST_SUBJECTS are excluded from both train and val in every
-    branch, even if explicitly listed in ``train_subjects``.
+    Subjects in RESERVED_TEST_SUBJECTS, and subjects with id <= MIN_SUBJECT_ID, are
+    excluded from both train and val in every branch, even if explicitly listed in
+    ``train_subjects``.
     """
     subject_ids = extract_subject_ids(dataset)
     reserved = set(RESERVED_TEST_SUBJECTS)
+
+    def _excluded(sid: int) -> bool:
+        # Subjects in the reserved test set, or with id <= MIN_SUBJECT_ID, are
+        # never used for train or val in any split mode.
+        return sid in reserved or sid <= MIN_SUBJECT_ID
+
     if subject_ids is not None and logger is not None:
-        reserved_present = sorted({sid for sid in subject_ids if sid in reserved})
-        if reserved_present:
-            logger.info("Reserved test subjects excluded from train/val: %s", reserved_present)
+        excluded_present = sorted({sid for sid in set(subject_ids) if _excluded(sid)})
+        if excluded_present:
+            logger.info(
+                "Subjects excluded from train/val (reserved %s or id<=%d): %s",
+                sorted(reserved), MIN_SUBJECT_ID, excluded_present,
+            )
 
     if train_subjects:
         if subject_ids is None:
             raise ValueError("Subject-wise split requested, but dataset does not expose per-sample subject_ids.")
-        train_subject_set = {int(sid) for sid in train_subjects} - reserved
+        train_subject_set = {int(sid) for sid in train_subjects if not _excluded(int(sid))}
         all_subjects = sorted(set(subject_ids))
         train_idx = [idx for idx, sid in enumerate(subject_ids) if sid in train_subject_set]
         val_idx = [
             idx
             for idx, sid in enumerate(subject_ids)
-            if sid not in train_subject_set and sid not in reserved
+            if sid not in train_subject_set and not _excluded(sid)
         ]
         missing_subjects = sorted(train_subject_set.difference(all_subjects))
         if missing_subjects and logger is not None:
@@ -122,9 +137,9 @@ def split_train_val_dataset(
             logger.info("Train samples=%s Val samples=%s", len(train_idx), len(val_idx))
         return Subset(dataset, train_idx), Subset(dataset, val_idx)
 
-    # Random split: restrict the eligible pool to non-reserved subjects first.
+    # Random split: restrict the eligible pool to eligible subjects first.
     if subject_ids is not None:
-        eligible = [idx for idx, sid in enumerate(subject_ids) if sid not in reserved]
+        eligible = [idx for idx, sid in enumerate(subject_ids) if not _excluded(sid)]
     else:
         eligible = list(range(len(dataset)))
 
@@ -382,6 +397,10 @@ class CSVPairedGaitDataset(Dataset):
                 skel = _skeleton_frame_to_joints(_fill_nan_with_column_mean(skeleton_map[fname].values), joints=joints)
                 phone_accel = _extract_sensor_3axis(phone_accel_map[fname])
                 watch_accel = _extract_sensor_3axis(watch_accel_map[fname])
+                # Resample both accelerometer streams onto the skeleton timeline so all
+                # three streams share the skeleton's frame count. This handles phone/watch
+                # IMU rates that differ from the skeleton rate, whereas naive truncation to
+                # the shortest length misaligns streams sampled at different rates.
                 t_skel = skel.shape[0]
                 phone_accel = _resample_to_length(phone_accel, t_skel)
                 watch_accel = _resample_to_length(watch_accel, t_skel)

@@ -14,6 +14,7 @@ from diffusion_model.graph_modules import (
     TemporalConvBlock,
     build_edge_index,
 )
+from diffusion_model.losses import base_of_support, center_of_mass, com_stability_margin
 from diffusion_model.shared_features import (
     SKELETON_SHARED_FEATURE_NAMES,
     build_skeleton_shared_motion_features,
@@ -27,15 +28,40 @@ from diffusion_model.util import (
 )
 
 
-SKELETON_FEATURE_SCHEMA: str = "coords_accel_angle10_angvel10_v1"
-SKELETON_FEATURE_NAMES: tuple[str, ...] = ("x", "y", "z") + SKELETON_SHARED_FEATURE_NAMES
-SKELETON_FEATURE_DIM: int = len(SKELETON_FEATURE_NAMES)  # 21
+SKELETON_FEATURE_SCHEMA: str = "coords_accel_angle10_angvel10_comstab1_com3_bos2_v3"
+SKELETON_FEATURE_NAMES: tuple[str, ...] = (
+    ("x", "y", "z")
+    + SKELETON_SHARED_FEATURE_NAMES
+    + ("com_stability_margin",)
+    + ("com_x", "com_y", "com_z")
+    + ("bos_left", "bos_right")
+)
+SKELETON_FEATURE_DIM: int = len(SKELETON_FEATURE_NAMES)  # 39
 
 
 def build_skeleton_features(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Expand raw skeleton coords [B, T, J, 3] into [B, T, J, 21]."""
+    """Expand raw skeleton coords [B, T, J, 3] into [B, T, J, 39].
+
+    The trailing six channels are whole-body balance quantities (notebook cells 1-3),
+    each a per-frame value broadcast identically to every joint:
+      - ``com_stability_margin`` (1): simple CoM-vs-BOS margin (lateral/X only).
+      - ``com_x/y/z`` (3): De Leva whole-body center of mass.
+      - ``bos_left/right`` (2): outer mediolateral edges of the ankle base of support.
+    """
     assert_shape(x, [None, None, None, 3], "build_skeleton_features.x")
-    features = torch.cat([x, build_skeleton_shared_motion_features(x, eps=eps)], dim=-1)
+    num_joints = x.shape[2]
+    margin = com_stability_margin(x)                                          # [B, T]
+    margin_feat = margin[:, :, None, None].expand(-1, -1, num_joints, 1)      # [B, T, J, 1]
+    com = center_of_mass(x)                                                   # [B, T, 3]
+    com_feat = com[:, :, None, :].expand(-1, -1, num_joints, -1)              # [B, T, J, 3]
+    bos_left, bos_right = base_of_support(x)                                  # [B, T] each
+    bos_feat = torch.stack([bos_left, bos_right], dim=-1)[:, :, None, :].expand(
+        -1, -1, num_joints, -1
+    )                                                                         # [B, T, J, 2]
+    features = torch.cat(
+        [x, build_skeleton_shared_motion_features(x, eps=eps), margin_feat, com_feat, bos_feat],
+        dim=-1,
+    )
     assert_shape(features, [x.shape[0], x.shape[1], x.shape[2], SKELETON_FEATURE_DIM], "build_skeleton_features.features")
     return features
 

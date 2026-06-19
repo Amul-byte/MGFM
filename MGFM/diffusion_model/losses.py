@@ -89,6 +89,20 @@ def center_of_mass(x: torch.Tensor, weights: tuple[float, ...] | None = None) ->
     return torch.einsum("btjc,j->btc", x, wt)
 
 
+def base_of_support(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """ML (X-axis) base-of-support edges from the two ankles. x:[B,T,J,3] -> (left,right) each [B,T].
+
+    Returns the outer mediolateral edges of the foot base: ``bos_outer_left`` (the more
+    negative ankle X) and ``bos_outer_right`` (the more positive ankle X). Built only from
+    joint X coordinates, so translation-invariant along X and valid on window-centered input.
+    """
+    left_ankle_x = x[:, :, ANKLE_JOINT_INDICES[0], 0]
+    right_ankle_x = x[:, :, ANKLE_JOINT_INDICES[1], 0]
+    bos_outer_left = torch.minimum(right_ankle_x, left_ankle_x)
+    bos_outer_right = torch.maximum(right_ankle_x, left_ankle_x)
+    return bos_outer_left, bos_outer_right
+
+
 def margin_of_stability(x: torch.Tensor, fps: float) -> torch.Tensor:
     """Hof (2005) Margin of Stability in the lateral (ML/X) axis. x: [B,T,J,3] -> [B,T].
 
@@ -109,10 +123,7 @@ def margin_of_stability(x: torch.Tensor, fps: float) -> torch.Tensor:
     leg_length = (hip_y - ankle_y).abs().mean(dim=1).clamp_min(EPS)      # [B]
     omega0 = torch.sqrt(GRAVITY / leg_length)                           # [B]
     xcom_ml = com_ml + com_ml_vel / omega0[:, None]                     # [B, T]
-    left_ankle_x = x[:, :, ANKLE_JOINT_INDICES[0], 0]
-    right_ankle_x = x[:, :, ANKLE_JOINT_INDICES[1], 0]
-    bos_outer_right = torch.maximum(right_ankle_x, left_ankle_x)
-    bos_outer_left = torch.minimum(right_ankle_x, left_ankle_x)
+    bos_outer_left, bos_outer_right = base_of_support(x)
     mos_right = bos_outer_right - xcom_ml
     mos_left = xcom_ml - bos_outer_left
     return torch.minimum(mos_right, mos_left)                           # [B, T]
@@ -138,10 +149,7 @@ def com_stability_margin(x: torch.Tensor) -> torch.Tensor:
     Translation-invariant, so valid on window-centered input.
     """
     com_ml = center_of_mass(x)[..., 0]                              # [B, T]
-    left_ankle_x = x[:, :, ANKLE_JOINT_INDICES[0], 0]
-    right_ankle_x = x[:, :, ANKLE_JOINT_INDICES[1], 0]
-    bos_outer_right = torch.maximum(right_ankle_x, left_ankle_x)
-    bos_outer_left = torch.minimum(right_ankle_x, left_ankle_x)
+    bos_outer_left, bos_outer_right = base_of_support(x)
     dist_to_right = bos_outer_right - com_ml
     dist_to_left = com_ml - bos_outer_left
     return torch.minimum(dist_to_right, dist_to_left)              # [B, T]
