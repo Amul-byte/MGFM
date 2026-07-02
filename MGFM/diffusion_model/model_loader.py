@@ -102,13 +102,45 @@ def save_checkpoint(path: str, model: nn.Module, extra: Dict[str, Any] | None = 
     print(f"Saved checkpoint: {path}")
 
 
+def _is_legacy_cnn_norm_buffer(key: str) -> bool:
+    """Return True for obsolete BatchNorm buffers from the old IMU CNN encoder."""
+    parts = key.split(".")
+    return (
+        len(parts) == 5
+        and parts[0] == "imu_encoder"
+        and parts[1] in {"phone_encoder", "watch_encoder", "diff_encoder"}
+        and parts[2] in {"block1", "block2", "block3", "block4"}
+        and parts[3] == "1"
+        and parts[4] in {"running_mean", "running_var", "num_batches_tracked"}
+    )
+
+
+def _drop_legacy_cnn_norm_buffers(state_dict: Dict[str, Any], model: nn.Module) -> tuple[Dict[str, Any], list[str]]:
+    """Remove legacy BatchNorm running-stat buffers that current GroupNorm models do not own."""
+    model_keys = set(model.state_dict().keys())
+    legacy_keys = sorted(
+        key for key in state_dict.keys()
+        if key not in model_keys and _is_legacy_cnn_norm_buffer(key)
+    )
+    if not legacy_keys:
+        return state_dict, []
+    dropped = set(legacy_keys)
+    filtered = {key: value for key, value in state_dict.items() if key not in dropped}
+    return filtered, legacy_keys
+
+
 def load_checkpoint(path: str, model: nn.Module, strict: bool = True) -> Dict[str, Any]:
     """Load checkpoint into model and print missing/unexpected keys."""
     checkpoint = torch.load(path, map_location="cpu")
     _validate_checkpoint_layout(checkpoint, path, model=model)
     state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+    dropped_legacy_keys: list[str] = []
+    if strict:
+        state_dict, dropped_legacy_keys = _drop_legacy_cnn_norm_buffers(state_dict, model)
     missing, unexpected = model.load_state_dict(state_dict, strict=strict)
     print(f"Loaded checkpoint: {path}")
+    if dropped_legacy_keys:
+        print(f"dropped legacy IMU CNN BatchNorm buffers ({len(dropped_legacy_keys)}): {dropped_legacy_keys}")
     print(f"missing keys ({len(missing)}): {missing}")
     print(f"unexpected keys ({len(unexpected)}): {unexpected}")
     return checkpoint
